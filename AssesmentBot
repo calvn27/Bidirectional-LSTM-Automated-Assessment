@@ -1,0 +1,382 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+import time
+from tqdm import tqdm
+import torchtext
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
+import yake
+from langdetect import detect
+import re
+import torch.nn.functional as F
+import spacy
+
+
+# Load data
+df = pd.read_csv(r"C:\Users\ncalvaresi\Documents\Safety_data_full.txt", delimiter='\t', encoding='latin1', on_bad_lines='skip')
+
+# Rename columns
+df.rename(columns={df.columns[0]: 'State', df.columns[6]: 'Observation', df.columns[7]: 'FollowupAction'}, inplace=True)
+
+# Replace and drop NAs
+df['FollowupAction'].fillna("None", inplace=True)
+df.dropna(subset=['Observation'], inplace=True)
+
+df = df[['Observation', 'Severity', 'Category']]
+
+new_entries = [
+    {'Observation': 'Spill', 'Severity': 'UNSAFE', 'Category': 'Slips/Trip Hazards'},
+    {'Observation': 'Leak', 'Severity': 'UNSAFE', 'Category': 'Slips/Trip Hazards'},
+    {'Observation': 'Fire', 'Severity': 'UNSAFE', 'Category': 'Fire Prevention'},
+    {'Observation': 'Puddle of water', 'Severity': 'UNSAFE', 'Category': 'Slips/Trip Hazards'},
+    {'Observation': 'Gap in the railing', 'Severity': 'UNSAFE', 'Category': 'Fall Protection'},
+    {'Observation': 'He was wearing his hard hat incorrectly', 'Severity': 'UNSAFE', 'Category': 'PPE'}
+     
+]
+
+# Convert the list of dictionaries to a DataFrame
+new_entries_df = pd.DataFrame(new_entries)
+
+# Add the new entries to the original DataFrame using pd.concat
+df = pd.concat([df, new_entries_df], ignore_index=True)
+
+# Filter for 'UNSAFE' and 'SAFE'
+filtered_df = df[df['Severity'].isin(['UNSAFE', 'SAFE'])]
+
+# Replace string 'nan' with actual NaN
+#filtered_df['Category'].replace('nan', np.nan, inplace=True)
+
+# Drop rows where the Category is NaN
+filtered_df.dropna(subset=['Category'], inplace=True)
+
+# Encode labels
+label_encoder = LabelEncoder()
+filtered_df['sentiment'] = label_encoder.fit_transform(filtered_df['Severity'])
+
+# Check data balance
+print(filtered_df['sentiment'].value_counts())
+
+def filter_text(text):
+    # Filter out None or common placeholder strings
+    if text is None or str(text).lower() in ['none', 'n/a', 'na', 'null']:
+        return False
+    # Filter out single letters, random numbers, and gibberish
+    if len(text) == 1 and text.isalpha():  # Filter out single letters
+        return False
+    if re.match(r'^[\W\d]*$', text):  # Filter out strings with only non-word characters or digits
+        return False
+    # Filter out non-English text
+    try:
+        lang = detect(text)
+        if lang != 'en':  # Change 'en' to 'de' or 'es' for German or Spanish, if needed
+            return False
+    except:
+        return False  # Handle cases where language detection fails
+    return True
+
+new_filtered_df = filtered_df[filtered_df['Observation'].apply(filter_text)]
+
+new_df = new_filtered_df[['Observation', 'sentiment', 'Category']]
+
+tokenizer = get_tokenizer("basic_english")
+
+# Build vocabulary
+def yield_tokens(data_iter):
+    for text in data_iter:
+        yield tokenizer(text)
+
+vocab = build_vocab_from_iterator(yield_tokens(df['Observation']), specials=["<unk>"])
+vocab.set_default_index(vocab["<unk>"])
+
+# Encode categories and severity
+label_encoder_category = LabelEncoder()
+df['category'] = label_encoder_category.fit_transform(df['Category'])
+
+label_encoder_severity = LabelEncoder()
+df['severity'] = label_encoder_severity.fit_transform(df['Severity'])
+
+# Prepare dataset
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+
+def encode(text):
+    return [vocab[token] for token in tokenizer(text)]
+
+train_df['encoded'] = train_df['Observation'].apply(encode)
+test_df['encoded'] = test_df['Observation'].apply(encode)
+
+MAX_SEQUENCE_LENGTH = 100
+
+def pad_sequence(seq, max_len):
+    if len(seq) > max_len:
+        return seq[:max_len]
+    else:
+        return seq + [0] * (max_len - len(seq))
+
+train_df['padded'] = train_df['encoded'].apply(lambda x: pad_sequence(x, MAX_SEQUENCE_LENGTH))
+test_df['padded'] = test_df['encoded'].apply(lambda x: pad_sequence(x, MAX_SEQUENCE_LENGTH))
+
+train_categories = torch.tensor(train_df['category'].tolist())
+test_categories = torch.tensor(test_df['category'].tolist())
+
+train_severities = torch.tensor(train_df['severity'].tolist())
+test_severities = torch.tensor(test_df['severity'].tolist())
+
+class TextDataset(Dataset):
+    def __init__(self, texts, categories, severities):
+        self.texts = texts
+        self.categories = categories
+        self.severities = severities
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        category = self.categories[idx]
+        severity = self.severities[idx]
+        return torch.tensor(text, dtype=torch.long), torch.tensor(category, dtype=torch.long), torch.tensor(severity, dtype=torch.long)
+
+train_dataset = TextDataset(train_df['padded'].tolist(), train_categories, train_severities)
+test_dataset = TextDataset(test_df['padded'].tolist(), test_categories, test_severities)
+
+train_dataloader = DataLoader(train_dataset, batch_size=15, shuffle=True)
+test_dataloader = DataLoader(test_dataset, batch_size=15, shuffle=False)
+
+
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.hidden_size = hidden_size
+        self.attention_weights = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.context_vector = nn.Parameter(torch.Tensor(hidden_size, 1))
+        nn.init.xavier_uniform_(self.attention_weights)
+        nn.init.xavier_uniform_(self.context_vector)
+    
+    def forward(self, hidden_states):
+        scores = torch.tanh(torch.matmul(hidden_states, self.attention_weights))
+        scores = torch.matmul(scores, self.context_vector).squeeze(-1)
+        attention_weights = torch.nn.functional.softmax(scores, dim=1)
+        weighted_sum = torch.sum(hidden_states * attention_weights.unsqueeze(-1), dim=1)
+        return weighted_sum
+
+class EnhancedTextClassificationModel(nn.Module):
+    def __init__(self, vocab_size, embed_size, num_classes_category, num_classes_severity):
+        super(EnhancedTextClassificationModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.lstm = nn.LSTM(embed_size, 128, batch_first=True, num_layers=2, bidirectional=True)
+        self.attention = Attention(128 * 2)  # Bidirectional LSTM has hidden_size*2
+        self.fc_category = nn.Linear(128 * 2, num_classes_category)
+        self.fc_severity = nn.Linear(128 * 2, num_classes_severity)
+        self.dropout = nn.Dropout(0.5)  # Added dropout for regularization
+    
+    def forward(self, x):
+        x = self.embedding(x)
+        x, _ = self.lstm(x)
+        x = self.attention(x)
+        x = self.dropout(x)
+        output_category = self.fc_category(x)
+        output_severity = self.fc_severity(x)
+        return output_category, output_severity
+
+
+# Set parameters
+VOCAB_SIZE = len(vocab)
+EMBED_SIZE = 100
+NUM_CLASSES_CATEGORY = len(label_encoder_category.classes_)  # Adjust based on the number of categories
+NUM_CLASSES_SEVERITY = len(label_encoder_severity.classes_)  # Adjust based on the number of severity levels
+
+model = EnhancedTextClassificationModel(VOCAB_SIZE, EMBED_SIZE, NUM_CLASSES_CATEGORY, NUM_CLASSES_SEVERITY)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+# Define optimizer and loss functions
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+criterion_category = nn.CrossEntropyLoss()
+criterion_severity = nn.CrossEntropyLoss()
+
+# Training loop
+num_epochs = 10
+
+for epoch in range(num_epochs):
+    model.train()
+    total_loss_category = 0.0
+    total_loss_severity = 0.0
+    start_epoch_time = time.time()
+    
+    for step, (texts, categories, severities) in enumerate(train_dataloader):
+        start_time = time.time()
+        
+        texts, categories, severities = texts.to(device), categories.to(device), severities.to(device)
+        
+        optimizer.zero_grad()
+        output_category, output_severity = model(texts)
+        loss_category = criterion_category(output_category, categories)
+        loss_severity = criterion_severity(output_severity, severities)
+        loss = loss_category + loss_severity
+        loss.backward()
+        optimizer.step()
+        
+        total_loss_category += loss_category.item()
+        total_loss_severity += loss_severity.item()
+        
+        end_time = time.time()
+        batch_time = end_time - start_time
+        
+        avg_batch_time = (end_time - start_epoch_time) / (step + 1)
+        remaining_batches = len(train_dataloader) - (step + 1)
+        estimated_remaining_time = remaining_batches * avg_batch_time
+        
+        if (step + 1) % 10 == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step+1}/{len(train_dataloader)}], Loss Category: {loss_category.item():.4f}, Loss Severity: {loss_severity.item():.4f}")
+            print(f"Estimated remaining time for epoch: {estimated_remaining_time:.2f} seconds")
+    
+    avg_loss_category = total_loss_category / len(train_dataloader)
+    avg_loss_severity = total_loss_severity / len(train_dataloader)
+    epoch_time = time.time() - start_epoch_time
+    print(f"Epoch {epoch+1} completed. Average Loss Category: {avg_loss_category:.4f}, Average Loss Severity: {avg_loss_severity:.4f}. Time taken: {epoch_time:.2f} seconds")
+
+
+# Evaluation function
+def evaluate(model, dataloader):
+    model.eval()
+    correct_category = 0
+    correct_severity = 0
+    total = 0
+    with torch.no_grad():
+        for texts, categories, severities in dataloader:
+            texts, categories, severities = texts.to(device), categories.to(device), severities.to(device)
+            output_category, output_severity = model(texts)
+            
+            _, predicted_category = torch.max(output_category.data, 1)
+            _, predicted_severity = torch.max(output_severity.data, 1)
+            
+            total += categories.size(0)
+            correct_category += (predicted_category == categories).sum().item()
+            correct_severity += (predicted_severity == severities).sum().item()
+    
+    accuracy_category = correct_category / total
+    accuracy_severity = correct_severity / total
+    print(f"Category Accuracy: {accuracy_category:.4f}, Severity Accuracy: {accuracy_severity:.4f}")
+
+# Evaluate on test data
+evaluate(model, test_dataloader)
+
+def predict_observation(observation, model, tokenizer, vocab, max_length, device, label_encoder_category, label_encoder_severity):
+    tokens = tokenizer(observation)
+    encoded = [vocab[token] for token in tokens]
+    padded = pad_sequence(encoded, max_length)
+    input_tensor = torch.tensor(padded, dtype=torch.long).unsqueeze(0).to(device)
+    
+    model.eval()
+    with torch.no_grad():
+        output_category, output_severity = model(input_tensor)
+        
+        # Calculate softmax probabilities for both category and severity
+        probabilities_category = F.softmax(output_category, dim=1)
+        probabilities_severity = F.softmax(output_severity, dim=1)
+        
+        # Get the predicted labels and confidence scores for both category and severity
+        confidence_category, predicted_label_category = torch.max(probabilities_category, dim=1)
+        confidence_severity, predicted_label_severity = torch.max(probabilities_severity, dim=1)
+    
+    # Convert the labels to the original category names and severity labels
+    predicted_category = label_encoder_category.inverse_transform([predicted_label_category.item()])[0]
+    predicted_severity = label_encoder_severity.inverse_transform([predicted_label_severity.item()])[0]
+    
+    # Get the confidence scores
+    confidence_score_category = confidence_category.item()
+    confidence_score_severity = confidence_severity.item()
+    
+    return {
+        'predicted_category': predicted_category,
+        'confidence_score_category': confidence_score_category,
+        'predicted_severity': predicted_severity,
+        'confidence_score_severity': confidence_score_severity
+    }
+
+
+nlp = spacy.load('en_core_web_sm')
+
+def clean_text(text):
+    # Convert text to lowercase
+    text = text.lower()
+    
+    # Remove special characters
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+    
+    # Lemmatize the text
+    doc = nlp(text)
+    return ' '.join([token.lemma_ for token in doc])
+
+
+def extract_keywords_percentages(observation, dataset, predicted_label, other_label):
+    
+    lemmatized_observation = clean_text(observation)
+    
+    # Lemmatize the dataset observations
+    #dataset['Lemmatized_Observation'] = dataset['Observation'].apply(lemmatize_text)
+    
+    kw_extractor = yake.KeywordExtractor()
+    language = "en"
+    max_ngram_size = 3
+    deduplication_threshold = 0.8
+    numOfKeywords = 10
+    custom_kw_extractor = yake.KeywordExtractor(lan=language, n=max_ngram_size, dedupLim=deduplication_threshold, top=numOfKeywords, features=None)
+    keywords = custom_kw_extractor.extract_keywords(lemmatized_observation)
+    
+    keywords_perc = {}
+    other_keywords_perc = {}
+
+    for keyword, _ in keywords:
+        # Filter dataset to include only observations containing the keyword
+        keyword_obs_df = dataset[dataset['Observation'].str.contains(keyword, case=False, na=False)]
+        
+        # Total number of observations containing the keyword
+        total_keyword_obs = keyword_obs_df.shape[0]
+        
+        # Number of observations containing the keyword and having the predicted label
+        label_keyword_obs = keyword_obs_df[keyword_obs_df['sentiment'] == predicted_label].shape[0]
+        other_label_keyword_obs = keyword_obs_df[keyword_obs_df['sentiment'] == other_label].shape[0]
+        
+        if total_keyword_obs > 0:
+            perc = label_keyword_obs / total_keyword_obs
+            perc_other = other_label_keyword_obs / total_keyword_obs
+        else:
+            perc = 0
+            perc_other = 0
+        
+        keywords_perc[keyword] = (perc, perc_other)
+    
+    return keywords_perc
+
+# Example usage
+observation = "He wore his hard hat incorrectly"
+
+# Assuming category_label_encoder and severity_label_encoder are defined
+prediction = predict_observation(observation, model, tokenizer, vocab, MAX_SEQUENCE_LENGTH, device, label_encoder_category, label_encoder_severity)
+
+predicted_category = prediction['predicted_category']
+predicted_severity = prediction['predicted_severity']
+confidence_score_category = prediction['confidence_score_category']
+confidence_score_severity = prediction['confidence_score_severity']
+
+# Assuming 0 and 1 are the only labels for severity (binary classification)
+predicted_label_severity = label_encoder_severity.transform([predicted_severity])[0]
+other_label_severity = 1 - predicted_label_severity
+
+keywords_percentages = extract_keywords_percentages(observation, new_filtered_df, predicted_label_severity, other_label_severity)
+
+print(f"Predicted Category: {predicted_category}, Confidence Score: {confidence_score_category:.4%}")
+print(f"Predicted Severity: {predicted_severity}, Confidence Score: {confidence_score_severity:.4%}")
+print("")
+for keyword, (perc, perc_other) in keywords_percentages.items():
+    print(f"Keyword: {keyword}, Percentage of {keyword} in {predicted_severity}: {perc:.4%} and Percentage of {keyword} in the other severity: {perc_other:.4%}")
