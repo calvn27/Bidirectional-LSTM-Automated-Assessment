@@ -1,0 +1,2 @@
+def encode(text):
+    return [vocab[token] for token in tokenizer(text)]
