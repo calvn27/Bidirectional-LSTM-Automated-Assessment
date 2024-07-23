@@ -1,0 +1,17 @@
+def filter_text(text):
+    # Filter out None or common placeholder strings
+    if text is None or str(text).lower() in ['none', 'n/a', 'na', 'null']:
+        return False
+    # Filter out single letters, random numbers, and gibberish
+    if len(text) == 1 and text.isalpha():  # Filter out single letters
+        return False
+    if re.match(r'^[\W\d]*$', text):  # Filter out strings with only non-word characters or digits
+        return False
+    # Filter out non-English text
+    try:
+        lang = detect(text)
+        if lang != 'en':  # Change 'en' to 'de' or 'es' for German or Spanish, if needed
+            return False
+    except:
+        return False  # Handle cases where language detection fails
+    return True
