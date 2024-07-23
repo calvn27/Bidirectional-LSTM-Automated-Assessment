@@ -1,0 +1,33 @@
+def predict_observation(observation, model, tokenizer, vocab, max_length, device, label_encoder_category, label_encoder_severity):
+    tokens = tokenizer(observation)
+    encoded = [vocab[token] for token in tokens]
+    padded = pad_sequence(encoded, max_length)
+    input_tensor = torch.tensor(padded, dtype=torch.long).unsqueeze(0).to(device)
+    
+    model.eval()
+    with torch.no_grad():
+        output_category, output_severity = model(input_tensor)
+        
+        # Calculate softmax probabilities for both category and severity
+        probabilities_category = F.softmax(output_category, dim=1)
+        probabilities_severity = F.softmax(output_severity, dim=1)
+        
+        # Get the predicted labels and confidence scores for both category and severity
+        confidence_category, predicted_label_category = torch.max(probabilities_category, dim=1)
+        confidence_severity, predicted_label_severity = torch.max(probabilities_severity, dim=1)
+    
+    # Convert the labels to the original category names and severity labels
+    predicted_category = label_encoder_category.inverse_transform([predicted_label_category.item()])[0]
+    predicted_severity = label_encoder_severity.inverse_transform([predicted_label_severity.item()])[0]
+    
+    # Get the confidence scores
+    confidence_score_category = confidence_category.item()
+    confidence_score_severity = confidence_severity.item()
+    
+    return {
+        'predicted_category': predicted_category,
+        'confidence_score_category': confidence_score_category,
+        'predicted_severity': predicted_severity,
+        'confidence_score_severity': confidence_score_severity
+    }
+
