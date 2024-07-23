@@ -1,0 +1,296 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+import time
+from tqdm import tqdm
+from langdetect import detect
+import re
+import torch.nn.functional as F
+import spacy
+import yake
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+
+# Load data
+df = pd.read_csv(r"C:\Users\ncalvaresi\Documents\Safety_data_full.txt", delimiter='\t', encoding='latin1', on_bad_lines='skip')
+
+# Rename columns
+df.rename(columns={df.columns[0]: 'State', df.columns[6]: 'Observation', df.columns[7]: 'FollowupAction'}, inplace=True)
+
+# Replace and drop NAs
+df['FollowupAction'].fillna("None", inplace=True)
+df.dropna(subset=['Observation'], inplace=True)
+
+# Filter columns and add new entries
+df = df[['Observation', 'Severity', 'Category']]
+new_entries = [
+    {'Observation': 'Spill', 'Severity': 'UNSAFE', 'Category': 'Slips/Trip Hazards'},
+    {'Observation': 'Leak', 'Severity': 'UNSAFE', 'Category': 'Slips/Trip Hazards'},
+    {'Observation': 'Fire', 'Severity': 'UNSAFE', 'Category': 'Fire Prevention'},
+    {'Observation': 'Puddle of water', 'Severity': 'UNSAFE', 'Category': 'Slips/Trip Hazards'},
+    {'Observation': 'Gap in the railing', 'Severity': 'UNSAFE', 'Category': 'Fall Protection'},
+    {'Observation': 'He was wearing his hard hat incorrectly', 'Severity': 'UNSAFE', 'Category': 'PPE'}
+]
+new_entries_df = pd.DataFrame(new_entries)
+df = pd.concat([df, new_entries_df], ignore_index=True)
+
+# Filter for 'UNSAFE' and 'SAFE'
+filtered_df = df[df['Severity'].isin(['UNSAFE', 'SAFE'])]
+filtered_df.dropna(subset=['Category'], inplace=True)
+
+# Encode labels
+label_encoder = LabelEncoder()
+filtered_df['sentiment'] = label_encoder.fit_transform(filtered_df['Severity'])
+
+# Filter text
+def filter_text(text):
+    if text is None or str(text).lower() in ['none', 'n/a', 'na', 'null']:
+        return False
+    if len(text) == 1 and text.isalpha():
+        return False
+    if re.match(r'^[\W\d]*$', text):
+        return False
+    try:
+        lang = detect(text)
+        if lang != 'en':
+            return False
+    except:
+        return False
+    return True
+
+new_filtered_df = filtered_df[filtered_df['Observation'].apply(filter_text)]
+new_df = new_filtered_df[['Observation', 'sentiment', 'Category']]
+
+# Tokenization and Vocabulary Building
+tokenizer = get_tokenizer("basic_english")
+def yield_tokens(data_iter):
+    for text in data_iter:
+        yield tokenizer(text)
+
+vocab = build_vocab_from_iterator(yield_tokens(new_df['Observation']), specials=["<unk>"])
+vocab.set_default_index(vocab["<unk>"])
+
+# Encode categories and severity
+label_encoder_category = LabelEncoder()
+new_df['category'] = label_encoder_category.fit_transform(new_df['Category'])
+
+label_encoder_severity = LabelEncoder()
+new_df['severity'] = label_encoder_severity.fit_transform(new_df['Severity'])
+
+# Prepare dataset
+train_df, test_df = train_test_split(new_df, test_size=0.2, random_state=42)
+def encode(text):
+    return [vocab[token] for token in tokenizer(text)]
+
+train_df['encoded'] = train_df['Observation'].apply(encode)
+test_df['encoded'] = test_df['Observation'].apply(encode)
+
+MAX_SEQUENCE_LENGTH = 100
+def pad_sequence(seq, max_len):
+    if len(seq) > max_len:
+        return seq[:max_len]
+    else:
+        return seq + [0] * (max_len - len(seq))
+
+train_df['padded'] = train_df['encoded'].apply(lambda x: pad_sequence(x, MAX_SEQUENCE_LENGTH))
+test_df['padded'] = test_df['encoded'].apply(lambda x: pad_sequence(x, MAX_SEQUENCE_LENGTH))
+
+train_categories = torch.tensor(train_df['category'].tolist())
+test_categories = torch.tensor(test_df['category'].tolist())
+train_severities = torch.tensor(train_df['severity'].tolist())
+test_severities = torch.tensor(test_df['severity'].tolist())
+
+# Custom Dataset and DataLoader
+class TextDataset(Dataset):
+    def __init__(self, texts, categories, severities):
+        self.texts = texts
+        self.categories = categories
+        self.severities = severities
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        category = self.categories[idx]
+        severity = self.severities[idx]
+        return torch.tensor(text, dtype=torch.long), torch.tensor(category, dtype=torch.long), torch.tensor(severity, dtype=torch.long)
+
+train_dataset = TextDataset(train_df['padded'].tolist(), train_categories, train_severities)
+test_dataset = TextDataset(test_df['padded'].tolist(), test_categories, test_severities)
+
+train_dataloader = DataLoader(train_dataset, batch_size=15, shuffle=True)
+test_dataloader = DataLoader(test_dataset, batch_size=15, shuffle=False)
+
+# Model Definition
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.hidden_size = hidden_size
+        self.attention_weights = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.context_vector = nn.Parameter(torch.Tensor(hidden_size, 1))
+        nn.init.xavier_uniform_(self.attention_weights)
+        nn.init.xavier_uniform_(self.context_vector)
+    
+    def forward(self, hidden_states):
+        scores = torch.tanh(torch.matmul(hidden_states, self.attention_weights))
+        scores = torch.matmul(scores, self.context_vector).squeeze(-1)
+        attention_weights = torch.nn.functional.softmax(scores, dim=1)
+        weighted_sum = torch.sum(hidden_states * attention_weights.unsqueeze(-1), dim=1)
+        return weighted_sum
+
+class EnhancedTextClassificationModel(nn.Module):
+    def __init__(self, vocab_size, embed_size, num_classes_category, num_classes_severity):
+        super(EnhancedTextClassificationModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.lstm = nn.LSTM(embed_size, 128, batch_first=True, num_layers=2, bidirectional=True)
+        self.attention = Attention(128 * 2)
+        self.fc_category = nn.Linear(128 * 2, num_classes_category)
+        self.fc_severity = nn.Linear(128 * 2, num_classes_severity)
+        self.dropout = nn.Dropout(0.5)
+    
+    def forward(self, x):
+        x = self.embedding(x)
+        x, _ = self.lstm(x)
+        x = self.attention(x)
+        x = self.dropout(x)
+        output_category = self.fc_category(x)
+        output_severity = self.fc_severity(x)
+        return output_category, output_severity
+
+# Set parameters
+VOCAB_SIZE = len(vocab)
+EMBED_SIZE = 100
+NUM_CLASSES_CATEGORY = len(label_encoder_category.classes_)
+NUM_CLASSES_SEVERITY = len(label_encoder_severity.classes_)
+
+model = EnhancedTextClassificationModel(VOCAB_SIZE, EMBED_SIZE, NUM_CLASSES_CATEGORY, NUM_CLASSES_SEVERITY)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+criterion_category = nn.CrossEntropyLoss()
+criterion_severity = nn.CrossEntropyLoss()
+
+# Training loop
+num_epochs = 10
+train_losses, test_losses, train_accs, test_accs = [], [], [], []
+
+for epoch in range(num_epochs):
+    model.train()
+    train_loss, correct_category, correct_severity = 0, 0, 0
+    total_samples = 0
+
+    start_time = time.time()
+    for batch in tqdm(train_dataloader):
+        texts, categories, severities = batch
+        optimizer.zero_grad()
+        output_category, output_severity = model(texts)
+        loss_category = criterion_category(output_category, categories)
+        loss_severity = criterion_severity(output_severity, severities)
+        loss = loss_category + loss_severity
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        _, pred_category = torch.max(output_category, 1)
+        _, pred_severity = torch.max(output_severity, 1)
+        correct_category += (pred_category == categories).sum().item()
+        correct_severity += (pred_severity == severities).sum().item()
+        total_samples += categories.size(0)
+
+    train_losses.append(train_loss / len(train_dataloader))
+    train_accs.append((correct_category + correct_severity) / (2 * total_samples))
+
+    model.eval()
+    test_loss, correct_category, correct_severity = 0, 0, 0
+    total_samples = 0
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader):
+            texts, categories, severities = batch
+            output_category, output_severity = model(texts)
+            loss_category = criterion_category(output_category, categories)
+            loss_severity = criterion_severity(output_severity)
+            loss = loss_category + loss_severity
+
+            test_loss += loss.item()
+            _, pred_category = torch.max(output_category, 1)
+            _, pred_severity = torch.max(output_severity, 1)
+            correct_category += (pred_category == categories).sum().item()
+            correct_severity += (pred_severity == severities).sum().item()
+            total_samples += categories.size(0)
+
+    test_losses.append(test_loss / len(test_dataloader))
+    test_accs.append((correct_category + correct_severity) / (2 * total_samples))
+
+    end_time = time.time()
+    print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_losses[-1]:.4f}, Test Loss: {test_losses[-1]:.4f}, Train Acc: {train_accs[-1]:.4f}, Test Acc: {test_accs[-1]:.4f}, Time: {end_time-start_time:.2f}s")
+
+# Evaluation function
+def evaluate(model, dataloader, criterion_category, criterion_severity):
+    model.eval()
+    loss, correct_category, correct_severity = 0, 0, 0
+    total_samples = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            texts, categories, severities = batch
+            output_category, output_severity = model(texts)
+            loss_category = criterion_category(output_category, categories)
+            loss_severity = criterion_severity(output_severity)
+            loss += loss_category + loss_severity
+
+            _, pred_category = torch.max(output_category, 1)
+            _, pred_severity = torch.max(output_severity, 1)
+            correct_category += (pred_category == categories).sum().item()
+            correct_severity += (pred_severity == severities).sum().item()
+            total_samples += categories.size(0)
+    avg_loss = loss / len(dataloader)
+    avg_accuracy = (correct_category + correct_severity) / (2 * total_samples)
+    return avg_loss, avg_accuracy
+
+# Predict function
+def predict_observation(model, text, vocab, tokenizer, label_encoder_category, label_encoder_severity):
+    model.eval()
+    tokens = [vocab[token] for token in tokenizer(text)]
+    tokens_padded = pad_sequence(tokens, MAX_SEQUENCE_LENGTH)
+    with torch.no_grad():
+        tokens_tensor = torch.tensor([tokens_padded], dtype=torch.long)
+        output_category, output_severity = model(tokens_tensor)
+        category_prob = F.softmax(output_category, dim=1)
+        severity_prob = F.softmax(output_severity, dim=1)
+        category_index = torch.argmax(category_prob, dim=1).item()
+        severity_index = torch.argmax(severity_prob, dim=1).item()
+    predicted_category = label_encoder_category.inverse_transform([category_index])[0]
+    predicted_severity = label_encoder_severity.inverse_transform([severity_index])[0]
+    return predicted_category, predicted_severity, category_prob[0].tolist(), severity_prob[0].tolist()
+
+# Text cleaning function
+def clean_text(text):
+    nlp = spacy.load('en_core_web_sm')
+    doc = nlp(text.lower())
+    tokens = [token.lemma_ for token in doc if not token.is_stop and token.is_alpha]
+    return ' '.join(tokens)
+
+# Keyword extraction
+def extract_keywords_percentages(text, num_keywords=10):
+    cleaned_text = clean_text(text)
+    kw_extractor = yake.KeywordExtractor(top=num_keywords, stopwords=None)
+    keywords = kw_extractor.extract_keywords(cleaned_text)
+    keyword_list = [keyword for keyword, _ in keywords]
+    total_words = len(cleaned_text.split())
+    keyword_percentages = [(keyword, cleaned_text.split().count(keyword) / total_words * 100) for keyword in keyword_list]
+    return keyword_percentages
+
+# Example usage
+example_text = "There was a small fire in the storage room due to an electrical fault."
+predicted_category, predicted_severity, category_prob, severity_prob = predict_observation(
+    model, example_text, vocab, tokenizer, label_encoder_category, label_encoder_severity
+)
+print("Predicted Category:", predicted_category)
+print("Predicted Severity:", predicted_severity)
+print("Category Probabilities:", category_prob)
+print("Severity Probabilities:", severity_prob)
+
+keywords_percentages = extract_keywords_percentages(example_text)
+print("Keywords and Percentages:", keywords_percentages)
