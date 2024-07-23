@@ -1,0 +1,21 @@
+# Evaluation function
+def evaluate(model, dataloader):
+    model.eval()
+    correct_category = 0
+    correct_severity = 0
+    total = 0
+    with torch.no_grad():
+        for texts, categories, severities in dataloader:
+            texts, categories, severities = texts.to(device), categories.to(device), severities.to(device)
+            output_category, output_severity = model(texts)
+            
+            _, predicted_category = torch.max(output_category.data, 1)
+            _, predicted_severity = torch.max(output_severity.data, 1)
+            
+            total += categories.size(0)
+            correct_category += (predicted_category == categories).sum().item()
+            correct_severity += (predicted_severity == severities).sum().item()
+    
+    accuracy_category = correct_category / total
+    accuracy_severity = correct_severity / total
+    print(f"Category Accuracy: {accuracy_category:.4f}, Severity Accuracy: {accuracy_severity:.4f}")
