@@ -1,4 +1,0 @@
-# Build vocabulary
-def yield_tokens(data_iter):
-    for text in data_iter:
-        yield tokenizer(text)
